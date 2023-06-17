@@ -9,18 +9,12 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .utils import (
-    round_filters,
-    round_repeats,
-    drop_connect,
-    get_same_padding_conv2d,
-    get_model_params,
-    efficientnet_params,
-    load_pretrained_weights,
-    Swish,
-    MemoryEfficientSwish,
-    calculate_output_image_size
-)
+
+from .utils import (MemoryEfficientSwish, Swish, calculate_output_image_size,
+                    drop_connect, efficientnet_params, get_model_params,
+                    get_same_padding_conv2d, load_pretrained_weights,
+                    round_filters, round_repeats)
+
 
 class MBConvBlock(nn.Module):
     """Mobile Inverted Residual Bottleneck Block.
@@ -36,7 +30,7 @@ class MBConvBlock(nn.Module):
         [3] https://arxiv.org/abs/1905.02244 (MobileNet v3)
     """
 
-    def __init__(self, block_args, global_params, image_size=None):
+    def __init__(self, block_args, global_params, image_size=None, drop_connect_rate=0):
         super().__init__()
         self._block_args = block_args
         self._bn_mom = 1 - global_params.batch_norm_momentum # pytorch's difference from tensorflow
@@ -75,12 +69,17 @@ class MBConvBlock(nn.Module):
         Conv2d = get_same_padding_conv2d(image_size=image_size)
         self._project_conv = Conv2d(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
         self._bn2 = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
+        self._drop_connect_rate = drop_connect_rate
+        self._dropout = nn.Dropout(drop_connect_rate)
         if global_params.relu_fn == 'relu6':
             self._swish = nn.ReLU6()
         else:
             self._swish = MemoryEfficientSwish()
 
-    def forward(self, inputs, drop_connect_rate=None):
+    def _drop_connect(self, inputs):
+        return self._dropout(inputs) / (1-self._drop_connect_rate)
+
+    def forward(self, inputs):
         """MBConvBlock's forward function.
 
         Args:
@@ -118,8 +117,8 @@ class MBConvBlock(nn.Module):
         input_filters, output_filters = self._block_args.input_filters, self._block_args.output_filters
         if self.id_skip and self._block_args.stride == 1 and input_filters == output_filters:
             # The combination of skip connection and drop connect brings about stochastic depth.
-            if drop_connect_rate:
-                x = drop_connect(x, p=drop_connect_rate, training=self.training)
+            if self._drop_connect_rate > 0:
+                x = self._drop_connect(x)
             x = x + inputs  # skip connection
         return x
 
@@ -139,7 +138,7 @@ class EfficientNet(nn.Module):
     Args:
         blocks_args (list[namedtuple]): A list of BlockArgs to construct blocks.
         global_params (namedtuple): A set of GlobalParams shared between blocks.
-    
+
     References:
         [1] https://arxiv.org/abs/1905.11946 (EfficientNet)
 
@@ -178,6 +177,11 @@ class EfficientNet(nn.Module):
 
         # Build blocks
         self._blocks = nn.ModuleList([])
+        total_blocks = 0
+        for i, block_args in enumerate( self._blocks_args ):
+            total_blocks += block_args.num_repeat
+
+        block_idx = 0
         for i, block_args in enumerate( self._blocks_args ):
 
             # Update block input and output filters based on depth multiplier.
@@ -192,7 +196,7 @@ class EfficientNet(nn.Module):
                     input_filters = 32 # override when head stem is fixed??
             else:
                 repeats = round_repeats(block_args.num_repeat, self._global_params)
-            
+
             block_args = block_args._replace(
                 input_filters = input_filters,
                 output_filters = output_filters,
@@ -200,14 +204,18 @@ class EfficientNet(nn.Module):
             )
 
             # print( 'block %d args: %s' % ( i, block_args ) )
-            
+
             # The first block needs to take care of stride and filter size increase.
-            self._blocks.append(MBConvBlock(block_args, self._global_params, image_size=image_size))
+            block_idx += 1
+            block_drop_connect_rate = self._global_params.drop_connect_rate * float(block_idx) / total_blocks
+            self._blocks.append(MBConvBlock(block_args, self._global_params, image_size=image_size, drop_connect_rate=block_drop_connect_rate))
             image_size = calculate_output_image_size(image_size, block_args.stride)
             if block_args.num_repeat > 1: # modify block_args to keep same output size
                 block_args = block_args._replace(input_filters=block_args.output_filters, stride=1)
             for _ in range(block_args.num_repeat - 1):
-                self._blocks.append(MBConvBlock(block_args, self._global_params, image_size=image_size))
+                block_idx += 1
+                block_drop_connect_rate = self._global_params.drop_connect_rate * float(block_idx) / total_blocks
+                self._blocks.append(MBConvBlock(block_args, self._global_params, image_size=image_size, drop_connect_rate=block_drop_connect_rate))
                 # image_size = calculate_output_image_size(image_size, block_args.stride)  # stride = 1
 
             # print( 'img_size: ', image_size )
@@ -250,7 +258,7 @@ class EfficientNet(nn.Module):
             inputs (tensor): Input tensor.
 
         Returns:
-            Output of the final convolution 
+            Output of the final convolution
             layer in the efficientnet model.
         """
         # Stem
@@ -258,11 +266,8 @@ class EfficientNet(nn.Module):
 
         # Blocks
         for idx, block in enumerate(self._blocks):
-            drop_connect_rate = self._global_params.drop_connect_rate
-            if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self._blocks) # scale drop connect_rate
-            x = block(x, drop_connect_rate=drop_connect_rate)
-        
+            x = block(x)
+
         # Head
         x = self._swish(self._bn1(self._conv_head(x)))
 
@@ -292,10 +297,10 @@ class EfficientNet(nn.Module):
             # -> (?, 1, 1, 1280)
             # outputs = tf.squeeze(outputs, self._spatial_dims)
             # -> (?, 1280)
-            
+
             kernel_size = self.feature_output_image_size
             print( 'local_pooling: ', kernel_size, x.shape )
-            
+
             # x = F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=0)
             x = x.view(bs, 1280, -1)
             print( 'view: ', x.shape )
@@ -321,7 +326,7 @@ class EfficientNet(nn.Module):
         Args:
             model_name (str): Name for efficientnet.
             in_channels (int): Input data's channel number.
-            override_params (other key word params): 
+            override_params (other key word params):
                 Params to override model's global_params.
                 Optional key:
                     'width_coefficient', 'depth_coefficient',
@@ -340,23 +345,23 @@ class EfficientNet(nn.Module):
         return model
 
     @classmethod
-    def from_pretrained(cls, model_name, weights_path=None, advprop=False, 
+    def from_pretrained(cls, model_name, weights_path=None, advprop=False,
                         in_channels=3, num_classes=1000, **override_params):
         """create an efficientnet model according to name.
 
         Args:
             model_name (str): Name for efficientnet.
-            weights_path (None or str): 
+            weights_path (None or str):
                 str: path to pretrained weights file on the local disk.
                 None: use pretrained weights downloaded from the Internet.
-            advprop (bool): 
+            advprop (bool):
                 Whether to load pretrained weights
                 trained with advprop (valid when weights_path is None).
             in_channels (int): Input data's channel number.
-            num_classes (int): 
+            num_classes (int):
                 Number of categories for classification.
                 It controls the output size for final linear layer.
-            override_params (other key word params): 
+            override_params (other key word params):
                 Params to override model's global_params.
                 Optional key:
                     'width_coefficient', 'depth_coefficient',
@@ -389,7 +394,7 @@ class EfficientNet(nn.Module):
 
     @classmethod
     def _check_model_name_is_valid(cls, model_name):
-        """Validates model name. 
+        """Validates model name.
 
         Args:
             model_name (str): Name for efficientnet.
@@ -403,10 +408,10 @@ class EfficientNet(nn.Module):
         valid_models += ['efficientnet-l2']
 
         valid_models += ['efficientnet-lite'+str(i) for i in range(5)]
-        
+
         if model_name not in valid_models:
             raise ValueError('model_name should be one of: ' + ', '.join(valid_models))
-    
+
     def _change_in_channels(self, in_channels):
         """Adjust model's first convolution layer to in_channels, if in_channels not equals 3.
 
@@ -429,7 +434,7 @@ class EfficientNet(nn.Module):
 
         input_names = [ self.input_name ]
         output_names = [ self.output_name ]
-        
+
         torch.onnx.export(
             self,
             sample_input,
@@ -445,8 +450,8 @@ class EfficientNet(nn.Module):
 
         self.input_name = 'input.1' # hack
         self.output_name = 'classes' # hack
-        
-        
+
+
         torch_output = self.gen_torch_output( sample_input )
         print( 'torch_output: shape %s\nsample %s ' % ( torch_output.shape, torch_output[0,:3] ) )
 
@@ -462,7 +467,7 @@ class EfficientNet(nn.Module):
 
         mlmodel = onnx_coreml.convert(
             model=filename_onnx,
-            **convert_params, 
+            **convert_params,
         )
 
         '''
@@ -482,13 +487,13 @@ class EfficientNet(nn.Module):
         }
         # do forward pass
         mlmodel_output = mlmodel.predict(model_inputs, useCPUOnly=True)
-        
+
         print( 'mlmodel_output: shape %s\nsample %s ' % ( mlmodel_output.shape, mlmodel_output[:3] ) )
 
         return torch_output, mlmodel_output
 
 '''
-import torch 
+import torch
 from PIL import Image
 from torchvision import transforms
 
@@ -522,38 +527,38 @@ for idx in torch.topk(outputs, k=5).indices.squeeze(0).tolist():
 
 '''
 # bash demo.cmd efficientnet-lite0
-  -> top_0 (96.81%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca  
-  -> top_1 (0.16%): Staffordshire bullterrier, Staffordshire bull terrier  
-  -> top_2 (0.09%): Samoyed, Samoyede  
-  -> top_3 (0.08%): Arctic fox, white fox, Alopex lagopus  
-  -> top_4 (0.07%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus  
+  -> top_0 (96.81%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca
+  -> top_1 (0.16%): Staffordshire bullterrier, Staffordshire bull terrier
+  -> top_2 (0.09%): Samoyed, Samoyede
+  -> top_3 (0.08%): Arctic fox, white fox, Alopex lagopus
+  -> top_4 (0.07%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus
 
 # bash demo.cmd efficientnet-lite1
-  -> top_0 (44.93%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca  
-  -> top_1 (1.26%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus  
-  -> top_2 (0.63%): American black bear, black bear, Ursus americanus, Euarctos americanus  
-  -> top_3 (0.61%): albatross, mollymawk  
-  -> top_4 (0.58%): white wolf, Arctic wolf, Canis lupus tundrarum  
+  -> top_0 (44.93%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca
+  -> top_1 (1.26%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus
+  -> top_2 (0.63%): American black bear, black bear, Ursus americanus, Euarctos americanus
+  -> top_3 (0.61%): albatross, mollymawk
+  -> top_4 (0.58%): white wolf, Arctic wolf, Canis lupus tundrarum
 
 # bash demo.cmd efficientnet-lite2
-  -> top_0 (62.82%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca  
-  -> top_1 (1.04%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus  
-  -> top_2 (0.39%): Arctic fox, white fox, Alopex lagopus  
-  -> top_3 (0.31%): Samoyed, Samoyede  
-  -> top_4 (0.31%): lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens  
+  -> top_0 (62.82%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca
+  -> top_1 (1.04%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus
+  -> top_2 (0.39%): Arctic fox, white fox, Alopex lagopus
+  -> top_3 (0.31%): Samoyed, Samoyede
+  -> top_4 (0.31%): lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens
 
 # bash demo.cmd efficientnet-lite3
-  -> top_0 (84.02%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca  
-  -> top_1 (1.27%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus  
-  -> top_2 (0.27%): brown bear, bruin, Ursus arctos  
-  -> top_3 (0.23%): American black bear, black bear, Ursus americanus, Euarctos americanus  
-  -> top_4 (0.19%): lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens  
+  -> top_0 (84.02%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca
+  -> top_1 (1.27%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus
+  -> top_2 (0.27%): brown bear, bruin, Ursus arctos
+  -> top_3 (0.23%): American black bear, black bear, Ursus americanus, Euarctos americanus
+  -> top_4 (0.19%): lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens
 
 # bash demo.cmd efficientnet-lite4
-  -> top_0 (85.58%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca  
-  -> top_1 (0.26%): brown bear, bruin, Ursus arctos  
-  -> top_2 (0.24%): American black bear, black bear, Ursus americanus, Euarctos americanus  
-  -> top_3 (0.16%): lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens  
-  -> top_4 (0.15%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus  
+  -> top_0 (85.58%): giant panda, panda, panda bear, coon bear, Ailuropoda melanoleuca
+  -> top_1 (0.26%): brown bear, bruin, Ursus arctos
+  -> top_2 (0.24%): American black bear, black bear, Ursus americanus, Euarctos americanus
+  -> top_3 (0.16%): lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens
+  -> top_4 (0.15%): ice bear, polar bear, Ursus Maritimus, Thalarctos maritimus
 
 '''
